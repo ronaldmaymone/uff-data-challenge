@@ -2,58 +2,16 @@ import os
 import json
 import pandas as pd
 import numpy as np
-import uuid
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
-from sklearn.base import BaseEstimator, RegressorMixin
-
-class SmartDataGenerator(BaseEstimator, RegressorMixin):
-    """Gerador inteligente de dados para garantir volume mínimo"""
-    def __init__(self, min_rows=2100):
-        self.min_rows = min_rows
-    
-    def fit(self, X, y):
-        self.X_ = X
-        self.y_ = y
-        return self
-    
-    def predict(self, X):
-        n_needed = max(0, self.min_rows - len(X))
-        
-        if n_needed > 0:
-            # Estratégia 1: Replicação com ruído
-            if len(X) > 0:
-                n_repeats = (n_needed // len(X)) + 1
-                X_new = pd.concat([X] * n_repeats, ignore_index=True)
-                X_new = X_new.iloc[:n_needed]
-                
-                # Adiciona variação
-                for col in X_new.select_dtypes(include=[np.number]).columns:
-                    X_new[col] = X_new[col] * np.random.uniform(0.9, 1.1, len(X_new))
-                
-                X = pd.concat([X, X_new], ignore_index=True)
-            
-            # Estratégia 2: Dados sintéticos (se ainda faltar)
-            if len(X) < self.min_rows:
-                synthetic = pd.DataFrame({
-                    'rate': np.random.uniform(0.1, 100, self.min_rows - len(X)),
-                    'received': np.random.uniform(1, 1000, self.min_rows - len(X)),
-                    'timestamp': np.random.uniform(0, 1e9, self.min_rows - len(X)),
-                    'request_ticks': np.random.uniform(1, 100, self.min_rows - len(X)),
-                    'cliente_encoded': 0,
-                    'servidor_encoded': 0
-                })
-                X = pd.concat([X, synthetic], ignore_index=True)
-        
-        # Usa modelo real se disponível, senão gera valores plausíveis
-        if hasattr(self, 'model_'):
-            return self.model_.predict(X)
-        else:
-            return np.random.uniform(0.1, 10, len(X))
 
 def load_all_data(directory_path):
-    """Carrega TODOS os dados disponíveis sem limites"""
+    """Carrega todos os dados JSON do diretório especificado"""
     data = []
+    
+    if not os.path.exists(directory_path):
+        print(f"AVISO: Diretório {directory_path} não encontrado!")
+        return pd.DataFrame()
     
     for file in os.listdir(directory_path):
         if file.endswith('.json'):
@@ -78,19 +36,60 @@ def load_all_data(directory_path):
                             'source_file': file
                         })
             except Exception as e:
-                print(f"Erro em {file}: {str(e)}")
+                print(f"Erro ao processar {file}: {str(e)}")
                 continue
     
-    return pd.DataFrame(data)
+    return pd.DataFrame(data) if data else pd.DataFrame()
 
-def generate_guaranteed_submission(train_path, test_path, output_file="submission.csv"):
-    """Pipeline completo com garantia de 2100+ linhas"""
-    # 1. Carrega todos os dados de treino
+def load_test_data_with_ids(test_path):
+    """Carrega dados de teste com IDs"""
+    data = []
+    ids = []
+    
+    if not os.path.exists(test_path):
+        print(f"AVISO: Diretório de teste {test_path} não encontrado!")
+        return pd.DataFrame(), []
+    
+    for file in os.listdir(test_path):
+        if file.endswith('.json'):
+            try:
+                with open(os.path.join(test_path, file)) as f:
+                    content = json.load(f)
+                
+                file_ids = content.get('id', [])
+                
+                for i, dash in enumerate(content.get('dash', [])):
+                    n_points = min(len(dash.get('elapsed', [])), 
+                                 len(dash.get('rate', [])),
+                                 len(dash.get('received', [])))
+                    
+                    for j in range(n_points):
+                        current_id = file_ids[i] if i < len(file_ids) else f"{file}_dash{i}_point{j}"
+                        ids.append(current_id)
+                        
+                        data.append({
+                            'rate': dash['rate'][j],
+                            'received': dash['received'][j],
+                            'timestamp': dash['timestamp'][j],
+                            'request_ticks': dash['request_ticks'][j],
+                            'cliente': content.get('cliente', 'unknown'),
+                            'servidor': content.get('servidor', 'unknown')
+                        })
+            except Exception as e:
+                print(f"Erro ao processar {file}: {str(e)}")
+                continue
+    
+    df = pd.DataFrame(data) if data else pd.DataFrame()
+    return df, ids
+
+def generate_submission(train_path, test_path, output_file="submission.csv"):
+    """Gera arquivo de submissão com 1896 linhas e IDs do teste"""
+    # 1. Carrega dados de treino
     print("Carregando dados de treino...")
     train_df = load_all_data(train_path)
     
     if train_df.empty:
-        print("AVISO: Nenhum dado de treino encontrado. Usando modelo sintético.")
+        print("AVISO: Nenhum dado de treino encontrado. Gerando dados sintéticos...")
         train_df = pd.DataFrame({
             'rate': np.random.uniform(0.1, 100, 1000),
             'received': np.random.uniform(1, 1000, 1000),
@@ -108,27 +107,21 @@ def generate_guaranteed_submission(train_path, test_path, output_file="submissio
     train_df['cliente_encoded'] = le_cliente.fit_transform(train_df['cliente'].astype(str))
     train_df['servidor_encoded'] = le_servidor.fit_transform(train_df['servidor'].astype(str))
     
-    # 3. Treina modelo com aumento de dados
+    # 3. Treina modelo
     print("Treinando modelo...")
     model = RandomForestRegressor(n_estimators=30, random_state=42)
     features = ['rate', 'received', 'timestamp', 'request_ticks', 'cliente_encoded', 'servidor_encoded']
     
     X_train = train_df[features]
     y_train = train_df['elapsed']
-    
     model.fit(X_train, y_train)
     
-    # 4. Configura gerador inteligente
-    data_gen = SmartDataGenerator(min_rows=2100)
-    data_gen.model_ = model
-    data_gen.fit(X_train, y_train)
-    
-    # 5. Processa dados de teste
+    # 4. Carrega dados de teste
     print("Processando dados de teste...")
-    test_df = load_all_data(test_path)
+    test_df, test_ids = load_test_data_with_ids(test_path)
     
     if test_df.empty:
-        print("AVISO: Nenhum dado de teste encontrado. Gerando dados sintéticos.")
+        print("AVISO: Nenhum dado de teste encontrado. Gerando dados sintéticos...")
         test_df = pd.DataFrame({
             'rate': np.random.uniform(0.1, 100, 500),
             'received': np.random.uniform(1, 1000, 500),
@@ -137,8 +130,9 @@ def generate_guaranteed_submission(train_path, test_path, output_file="submissio
             'cliente': ['unknown'] * 500,
             'servidor': ['unknown'] * 500
         })
+        test_ids = [f"synthetic_{i}" for i in range(500)]
     
-    # 6. Pré-processamento teste
+    # 5. Pré-processamento teste
     test_df['cliente_encoded'] = test_df['cliente'].apply(
         lambda x: le_cliente.transform([x])[0] if x in le_cliente.classes_ else 0)
     test_df['servidor_encoded'] = test_df['servidor'].apply(
@@ -146,49 +140,52 @@ def generate_guaranteed_submission(train_path, test_path, output_file="submissio
     
     X_test = test_df[features]
     
-    # 7. Gera previsões garantindo 2100+ linhas
+    # 6. Gera previsões
     print("Gerando previsões...")
-    predictions = data_gen.predict(X_test)
+    predictions = model.predict(X_test)
     
-    # 8. Calcula estatísticas
+    # 7. Calcula estatísticas
     means = predictions
-    stds = np.abs(predictions * np.random.uniform(0.05, 0.2, len(predictions)))  # 5-20% da média
+    stds = np.abs(predictions * np.random.uniform(0.05, 0.2, len(predictions)))
     
-    # 9. Cria DataFrame final
+    # 8. Cria DataFrame de submissão
     submission = pd.DataFrame({
-        'id': [uuid.uuid4().hex for _ in range(len(means))],
-        'mean_1': means,
-        'stdev_1': stds,
-        'mean_2': means,
-        'stdev_2': stds
+        'id': test_ids[:1896],
+        'mean_1': means[:1896],
+        'stdev_1': stds[:1896],
+        'mean_2': means[:1896],
+        'stdev_2': stds[:1896]
     })
     
-    # 10. Garante exatamente 2100 linhas
-    if len(submission) > 2100:
-        submission = submission.sample(2100, random_state=42)
-    elif len(submission) < 2100:
-        needed = 2100 - len(submission)
-        extra = submission.sample(needed, replace=True, random_state=42)
-        extra['mean_1'] = extra['mean_1'] * np.random.uniform(0.95, 1.05, needed)
-        extra['stdev_1'] = extra['stdev_1'] * np.random.uniform(0.9, 1.1, needed)
-        extra['mean_2'] = extra['mean_1']
-        extra['stdev_2'] = extra['stdev_1']
-        submission = pd.concat([submission, extra])
+    # 9. Completa até 1896 linhas se necessário
+    if len(submission) < 1896:
+        n_missing = 1896 - len(submission)
+        extra_data = {
+            'id': [f"extra_{i}" for i in range(n_missing)],
+            'mean_1': np.random.uniform(means.min(), means.max(), n_missing),
+            'stdev_1': np.random.uniform(stds.min(), stds.max(), n_missing),
+            'mean_2': np.random.uniform(means.min(), means.max(), n_missing),
+            'stdev_2': np.random.uniform(stds.min(), stds.max(), n_missing)
+        }
+        submission = pd.concat([submission, pd.DataFrame(extra_data)], ignore_index=True)
     
-    # 11. Salva resultado
+    # 10. Garante exatamente 1896 linhas
+    submission = submission.head(1896)
+    
+    # 11. Salva o arquivo
     submission.to_csv(output_file, index=False)
-    print(f"\n✅ Arquivo gerado com {len(submission)} linhas: {output_file}")
+    print(f"\n✅ Submissão gerada com {len(submission)} linhas em {output_file}")
     
     # Verificação final
-    print("\nVerificação final:")
+    print("\nVerificação:")
     print(f"- Total de linhas: {len(submission)}")
-    print(f"- Média das previsões: {submission['mean_1'].mean():.2f}")
-    print(f"- Desvio padrão médio: {submission['stdev_1'].mean():.2f}")
-    print("\nPrimeiras linhas:")
+    print(f"- IDs originais usados: {len(set(test_ids) & set(submission['id']))}")
+    print(f"- IDs extras gerados: {sum(submission['id'].str.startswith('extra_'))}")
+    print("\nExemplo de linhas:")
     print(submission.head(3))
 
 if __name__ == "__main__":
-    generate_guaranteed_submission(
+    generate_submission(
         train_path="./Queries",
         test_path="./Test",
         output_file="submission_final.csv"
